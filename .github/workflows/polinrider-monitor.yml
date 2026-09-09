@@ -1,0 +1,132 @@
+# Central PolinRider monitor + healer. Lives in a SEPARATE private repo (e.g. `polinrider-monitor`) nobody pushes code to.
+# Every hour, for every repo the token can see:
+#   - logs force-pushes with the acting ACCOUNT and before/after SHAs (GitHub's own activity log)
+#   - scans the default branch + every branch pushed in the last 25 h for PolinRider payloads
+#   - HEALS: strips payloads / deletes artifacts via the API (a normal fast-forward commit), and re-adds the guard workflow if it was removed
+#   - reports in an issue in THIS repo
+# Secret: GH_PAT  — fine-grained PAT with Contents: read+write and Metadata: read on all your repos, Issues: write on the log repo.
+# Keep a copy of repo-files/.github/* in this repo under guard-files/ (the workflow restores them from there).
+# FREE-PLAN MINUTES: a private monitor repo shares your 2000 free minutes/month → keep the hourly cron (~1500 min/month).
+#   To run every 10 minutes for free, make THIS repo public (it holds no secrets in code) and set LOG_REPO below to a private
+#   repo (e.g. usamahussain/polinrider-log) so findings/actor names stay private.
+name: PolinRider monitor
+on:
+  schedule:
+    - cron: '23 * * * *'      # hourly (private monitor repo)   |   public monitor repo: '*/10 * * * *'
+  workflow_dispatch:
+env:
+  LOG_REPO: ''                # '' = log issues in this repo; or 'owner/private-log-repo'
+permissions:
+  issues: write
+  contents: read
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const fs = require('fs');
+            const MARK = /rmcej%otb%|Cot%3t=shtP|_\$_1e42|A8-4892|RS260605|M260630A|__inzCR|193\.247\.144\.38|app-[A-Za-z]+-eval|verify-human\//;
+            const CONFIG = /(^|\/)[A-Za-z0-9._-]*\.config\.(js|mjs|cjs|ts|mts|cts)$/;
+            const ARTIFACT = /(^|\/)(temp_auto_push\.bat|config\.bat|fa-solid-400\.woff2)$/i;
+            const SKIP = /(^|\/)(node_modules|dist|build|\.next|vendor)\//;
+            const GUARD = ['.github/workflows/polinrider-guard.yml', '.github/polinrider-scan.sh'];
+            const guardSrc = {};
+            for (const p of GUARD) { try { guardSrc[p] = fs.readFileSync(`guard-files/${p}`, 'utf8'); } catch (e) { core.warning(`guard-files/${p} missing in this repo — guard restore disabled for it`); } }
+            const strip = (text) => {
+              const out = [];
+              for (const line of text.split('\n')) {
+                if (/^import \{ createRequire \} from 'module';\r?$/.test(line) || /^const require = createRequire\(import\.meta\.url\);\r?$/.test(line)) continue;
+                const m = line.match(/[ \t]{60,}[^ \t]/);
+                if (m) { const l = line.slice(0, m.index).replace(/[ \t]+$/, ''); if (l.length) out.push(l); break; }
+                out.push(line);
+              }
+              return out.join('\n') + (out.length ? '\n' : '');
+            };
+            const since = new Date(Date.now() - 25 * 3600 * 1000);
+            const findings = [], healed = []; let checked = 0;
+            const repos = await github.paginate(github.rest.repos.listForAuthenticatedUser, { per_page: 100, affiliation: 'owner,collaborator,organization_member' });
+            for (const r of repos) {
+              if (r.archived) continue;
+              const owner = r.owner.login, repo = r.name; checked++;
+              const branches = new Set([r.default_branch]);
+              try {
+                const acts = await github.paginate('GET /repos/{owner}/{repo}/activity', { owner, repo, time_period: 'day', per_page: 100 });
+                for (const a of acts) {
+                  if (new Date(a.timestamp) < since) continue;
+                  if (a.ref && a.ref.startsWith('refs/heads/')) branches.add(a.ref.slice(11));
+                  if (a.activity_type !== 'force_push') continue;
+                  findings.push(`FORCE-PUSH ${owner}/${repo} ${a.ref} by **${a.actor ? a.actor.login : '?'}** at ${a.timestamp} — before \`${a.before}\` after \`${a.after}\``);
+                  // Free-plan fallback (no ruleset to reject it): if the branch still points at the force-pushed tip AND that tip carries a payload, put the branch back.
+                  try {
+                    const b = a.ref.slice(11);
+                    const tip = (await github.rest.git.getRef({ owner, repo, ref: `heads/${b}` })).data.object.sha;
+                    if (tip !== a.after) continue;
+                    const tr = await github.rest.git.getTree({ owner, repo, tree_sha: a.after, recursive: '1' });
+                    let infected = false;
+                    for (const t of tr.data.tree) {
+                      if (t.type !== 'blob' || SKIP.test(t.path)) continue;
+                      if (ARTIFACT.test(t.path)) { infected = true; break; }
+                      if (CONFIG.test(t.path) && t.size > 2500) { const bl = await github.rest.git.getBlob({ owner, repo, file_sha: t.sha }); const tx = Buffer.from(bl.data.content, 'base64').toString('utf8'); if (MARK.test(tx) || /[ \t]{60,}\S/.test(tx)) { infected = true; break; } }
+                    }
+                    if (!infected) continue;
+                    await github.rest.git.updateRef({ owner, repo, ref: `heads/${b}`, sha: a.before, force: true });
+                    healed.push(`REVERTED force-push on ${owner}/${repo}@${b}: ${a.after.slice(0,7)} (infected, pushed by ${a.actor ? a.actor.login : '?'}) -> back to ${a.before.slice(0,7)}`);
+                  } catch (e) { findings.push(`  force-push revert failed on ${a.ref}: ${e.message}`); }
+                }
+              } catch (e) { core.warning(`${owner}/${repo}: activity: ${e.message}`); }
+              for (const branch of branches) {
+                try {
+                  const tree = await github.rest.git.getTree({ owner, repo, tree_sha: branch, recursive: '1' });
+                  const paths = new Set(tree.data.tree.map(t => t.path));
+                  for (const t of tree.data.tree) {
+                    if (t.type !== 'blob' || SKIP.test(t.path)) continue;
+                    const isArtifact = ARTIFACT.test(t.path); const isConfig = CONFIG.test(t.path);
+                    if (!isArtifact && !(isConfig && t.size > 2500)) continue;
+                    let bad = isArtifact, text = '';
+                    if (!isArtifact) {
+                      const blob = await github.rest.git.getBlob({ owner, repo, file_sha: t.sha });
+                      text = Buffer.from(blob.data.content, 'base64').toString('utf8');
+                      bad = MARK.test(text) || /[ \t]{60,}\S/.test(text);
+                    }
+                    if (!bad) continue;
+                    findings.push(`INFECTED ${owner}/${repo}@${branch}:${t.path} (${t.size} B)`);
+                    try {
+                      if (isArtifact) {
+                        await github.rest.repos.deleteFile({ owner, repo, path: t.path, branch, sha: t.sha, message: `security: delete PolinRider artifact ${t.path}` });
+                        healed.push(`deleted ${owner}/${repo}@${branch}:${t.path}`);
+                      } else {
+                        const clean = strip(text);
+                        if (MARK.test(clean)) { findings.push(`  could not strip ${t.path} — restore by hand`); continue; }
+                        await github.rest.repos.createOrUpdateFileContents({ owner, repo, path: t.path, branch, sha: t.sha, message: `security: strip PolinRider payload from ${t.path}`, content: Buffer.from(clean).toString('base64') });
+                        healed.push(`stripped ${owner}/${repo}@${branch}:${t.path} (${t.size} -> ${Buffer.byteLength(clean)} B)`);
+                      }
+                    } catch (e) { findings.push(`  heal failed for ${t.path}: ${e.message} (branch protected? add the PAT owner to the ruleset bypass list)`); }
+                  }
+                  if (branch === r.default_branch && !r.fork) {
+                    for (const [p, src] of Object.entries(guardSrc)) {
+                      if (paths.has(p)) continue;
+                      findings.push(`GUARD MISSING ${owner}/${repo}:${p}`);
+                      try {
+                        await github.rest.repos.createOrUpdateFileContents({ owner, repo, path: p, branch, message: `security: restore PolinRider guard (${p})`, content: Buffer.from(src).toString('base64') });
+                        healed.push(`restored ${owner}/${repo}:${p}`);
+                      } catch (e) { findings.push(`  restore failed: ${e.message}`); }
+                    }
+                  }
+                } catch (e) { core.warning(`${owner}/${repo}@${branch}: ${e.message}`); }
+              }
+            }
+            const md = `Checked ${checked} repos.\n\n**Findings (${findings.length})**\n` + (findings.map(f => '- ' + f).join('\n') || '_none_') + `\n\n**Healed (${healed.length})**\n` + (healed.map(f => '- ' + f).join('\n') || '_none_');
+            core.summary.addHeading('PolinRider monitor').addRaw(md).write();
+            if (!findings.length) return;
+            const logRepo = (process.env.LOG_REPO || '').trim();
+            const { owner, repo } = logRepo.includes('/') ? { owner: logRepo.split('/')[0], repo: logRepo.split('/')[1] } : context.repo; const label = 'polinrider-monitor';
+            try { await github.rest.issues.createLabel({ owner, repo, name: label, color: 'b60205' }); } catch (e) {}
+            const body = `### ${new Date().toISOString()}\n\n${md}\n\nRun: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const open = await github.rest.issues.listForRepo({ owner, repo, labels: label, state: 'open', per_page: 1 });
+            if (open.data.length) await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body });
+            else await github.rest.issues.create({ owner, repo, title: '🚨 PolinRider monitor: activity detected', labels: [label], body });
+            core.setFailed(`${findings.length} finding(s), ${healed.length} healed — see issue`);
