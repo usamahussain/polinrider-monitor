@@ -11,11 +11,8 @@
 #   repo (e.g. usamahussain/polinrider-log) so findings/actor names stay private.
 name: PolinRider monitor
 on:
-  schedule:
-    # WEEKLY (Sunday 03:23 UTC) — hourly costs ~2000 free Actions minutes/month on its own.
-    # Weekly is ~12 min/month and still gives a full all-branch sweep. Run it by hand any time
-    # from the Actions tab ("Run workflow") if you want an immediate check.
-    - cron: '23 3 * * 0'
+  # MANUAL ONLY — no `schedule:` on purpose. You decide when a full sweep runs, so it never
+  # burns Actions minutes on its own. Run it from the Actions tab: "PolinRider monitor" → Run workflow.
   workflow_dispatch:
 concurrency:
   group: polinrider-monitor   # never let two monitor runs overlap (overlap causes write races / spurious failures)
