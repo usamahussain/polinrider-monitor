@@ -12,7 +12,10 @@
 name: PolinRider monitor
 on:
   schedule:
-    - cron: '23 * * * *'      # hourly (private monitor repo)   |   public monitor repo: '*/10 * * * *'
+    # WEEKLY (Sunday 03:23 UTC) — hourly costs ~2000 free Actions minutes/month on its own.
+    # Weekly is ~12 min/month and still gives a full all-branch sweep. Run it by hand any time
+    # from the Actions tab ("Run workflow") if you want an immediate check.
+    - cron: '23 3 * * 0'
   workflow_dispatch:
 concurrency:
   group: polinrider-monitor   # never let two monitor runs overlap (overlap causes write races / spurious failures)
